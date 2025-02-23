@@ -14,8 +14,6 @@ exchange = ccxt.binance({
     'secret': api_secret,
 })
 
-symbols = ['BTC/USDT', 'ETH/USDT', 'BNB/USDT']
-amounts = {'BTC/USDT': 0.001, 'ETH/USDT': 0.01, 'BNB/USDT': 0.1}
 timeframe = '5m'
 trade_log_file = 'trade_log.csv'
 
@@ -55,6 +53,11 @@ def make_decision(df, model, scaler):
     else:
         return 'hold'
 
+def calculate_profit(df, buy_price, amount):
+    current_price = df['close'].iloc[-1]
+    profit = (current_price - buy_price) * amount
+    return profit
+
 def record_trade(symbol, decision, amount, price):
     trade = {
         'symbol': symbol,
@@ -66,47 +69,59 @@ def record_trade(symbol, decision, amount, price):
     trade_df = pd.DataFrame([trade])
     trade_df.to_csv(trade_log_file, mode='a', header=not pd.read_csv(trade_log_file).empty, index=False)
 
-def calculate_profit():
-    trades = pd.read_csv(trade_log_file)
-    profit = 0
-    for _, trade in trades.iterrows():
-        if trade['decision'] == 'buy':
-            profit -= trade['amount'] * trade['price']
-        elif trade['decision'] == 'sell':
-            profit += trade['amount'] * trade['price']
-    return profit
-
 def main():
     model = None
     scaler = None
+    buy_prices = {}
+    
     while True:
-        for symbol in symbols:
-            df = fetch_data(symbol, timeframe)
+        tickers = exchange.fetch_tickers()
+        best_symbol = None
+        best_score = -np.inf
+
+        for symbol in tickers:
+            if '/USDT' in symbol:
+                df = fetch_data(symbol, timeframe)
+                df = apply_technical_indicators(df)
+
+                if df.shape[0] == 0:
+                    continue
+
+                if model is None or scaler is None:
+                    model, scaler = train_model(df)
+
+                decision = make_decision(df, model, scaler)
+                if decision == 'buy':
+                    score = df['Returns'].mean() / df['Returns'].std()
+                    if score > best_score:
+                        best_score = score
+                        best_symbol = symbol
+
+        if best_symbol:
+            df = fetch_data(best_symbol, timeframe)
             df = apply_technical_indicators(df)
-            
-            if model is None or scaler is None:
-                model, scaler = train_model(df)
-            
             decision = make_decision(df, model, scaler)
-            
+
             balance = exchange.fetch_balance()
             usdt_balance = balance['total']['USDT']
-            coin_balance = balance['total'][symbol.split('/')[0]]
-            amount = amounts[symbol]
-            
+            coin_balance = balance['total'][best_symbol.split('/')[0]]
+            amount = usdt_balance / df['close'].iloc[-1] * 0.1  # 10% of USDT balance
+
             if decision == 'buy' and usdt_balance >= df['close'].iloc[-1] * amount:
-                order = exchange.create_market_buy_order(symbol, amount)
-                record_trade(symbol, 'buy', amount, df['close'].iloc[-1])
-                print(f"Bought {amount} of {symbol} at {df['close'].iloc[-1]} USDT")
+                order = exchange.create_market_buy_order(best_symbol, amount)
+                buy_prices[best_symbol] = df['close'].iloc[-1]
+                record_trade(best_symbol, 'buy', amount, buy_prices[best_symbol])
+                print(f"Bought {amount} of {best_symbol} at {buy_prices[best_symbol]} USDT")
             elif decision == 'sell' and coin_balance >= amount:
-                order = exchange.create_market_sell_order(symbol, amount)
-                record_trade(symbol, 'sell', amount, df['close'].iloc[-1])
-                print(f"Sold {amount} of {symbol} at {df['close'].iloc[-1]} USDT")
-        
-        profit = calculate_profit()
+                if calculate_profit(df, buy_prices.get(best_symbol, 0), amount) >= 0.05 * buy_prices.get(best_symbol, 0) * amount:  # %5 kâr hedefi
+                    order = exchange.create_market_sell_order(best_symbol, amount)
+                    record_trade(best_symbol, 'sell', amount, df['close'].iloc[-1])
+                    print(f"Sold {amount} of {best_symbol} at {df['close'].iloc[-1]} USDT")
+
+        profit = calculate_profit(df, buy_prices.get(best_symbol, 0), amount)
         print(f"Current Profit: {profit} USDT")
-        
-        time.sleep(20)
+
+        time.sleep(300)  # 5 dakika
 
 if __name__ == "__main__":
     main()
