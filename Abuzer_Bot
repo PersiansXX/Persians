@@ -1,0 +1,309 @@
+import ccxt
+import pandas as pd
+import numpy as np
+import talib
+import time
+import logging
+import asyncio
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import StandardScaler
+from backtesting import Backtest, Strategy
+
+# -------------------- KONFİGÜRASYON --------------------
+API_KEY = 'YOUR_API_KEY'
+API_SECRET = 'YOUR_API_SECRET'
+TIMEFRAME = '5m'
+INITIAL_BALANCE = 10000  # USDT
+MAX_RISK_PERCENT = 0.02  # Maksimum %2 risk
+# --------------------------------------------------------
+
+# Loglama Ayarları
+logging.basicConfig(
+    filename='auto_risk_bot.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+# Exchange Bağlantısı
+exchange = ccxt.binance({
+    'apiKey': API_KEY,
+    'secret': API_SECRET,
+    'enableRateLimit': True,
+})
+
+# Global Değişkenler
+models = {}
+scalers = {}
+open_positions = {}
+
+class DynamicRiskManager:
+    """Dinamik Risk Yönetimi Sınıfı"""
+    def __init__(self):
+        self.volatility_cache = {}
+        self.market_conditions = {}
+        self.portfolio_health = 1.0
+        
+    def calculate_adaptive_risk(self, symbol, df, portfolio_value):
+        """Piyasa Koşullarına Göre Risk Ayarlama"""
+        try:
+            # Volatilite Hesaplama
+            volatility = df['close'].pct_change().std() * np.sqrt(365)
+            
+            # Piyasa Durumu Analizi
+            market_trend = 1 if df['close'].iloc[-1] > df['SMA_20'].iloc[-1] else -1
+            rsi = df['RSI_14'].iloc[-1]
+            
+            # Risk Katsayıları
+            volatility_factor = np.clip(0.1 / volatility, 0.5, 2.0)
+            trend_factor = 1.5 if market_trend == 1 else 0.7
+            rsi_factor = np.interp(rsi, [30, 70], [1.2, 0.8])
+            
+            # Dinamik Risk Hesaplama
+            dynamic_risk = MAX_RISK_PERCENT * volatility_factor * trend_factor * rsi_factor
+            dynamic_risk = np.clip(dynamic_risk, 0.005, 0.05)
+            
+            # Pozisyon Boyutu
+            atr = df['ATR_14'].iloc[-1]
+            position_size = (portfolio_value * dynamic_risk) / (atr * 2)
+            
+            return position_size, {
+                'volatility': volatility,
+                'dynamic_risk': dynamic_risk,
+                'position_size': position_size
+            }
+            
+        except Exception as e:
+            logging.error(f"Risk hesaplama hatası: {str(e)}")
+            return 0, {}
+
+async def fetch_ohlcv(symbol, timeframe, limit=500):
+    """Asenkron OHLCV veri çekme"""
+    try:
+        ohlcv = await exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        return df.set_index('timestamp')
+    except Exception as e:
+        logging.error(f"{symbol} veri çekme hatası: {str(e)}")
+        return pd.DataFrame()
+
+def calculate_supertrend(df, period=10, multiplier=3):
+    """SuperTrend Göstergesi"""
+    hl2 = (df['high'] + df['low']) / 2
+    atr = talib.ATR(df['high'], df['low'], df['close'], period)
+    
+    upper_band = hl2 + (multiplier * atr)
+    lower_band = hl2 - (multiplier * atr)
+    
+    supertrend = pd.Series(index=df.index)
+    direction = pd.Series(1, index=df.index)
+    
+    for i in range(1, len(df)):
+        if df['close'].iloc[i] > upper_band.iloc[i-1]:
+            supertrend.iloc[i] = lower_band.iloc[i]
+            direction.iloc[i] = 1
+        else:
+            supertrend.iloc[i] = upper_band.iloc[i]
+            direction.iloc[i] = -1
+            
+    return supertrend
+
+def calculate_indicators(df):
+    """Teknik Göstergelerin Hesaplanması"""
+    try:
+        # Temel Göstergeler
+        df['SMA_20'] = talib.SMA(df['close'], 20)
+        df['EMA_20'] = talib.EMA(df['close'], 20)
+        df['RSI_14'] = talib.RSI(df['close'], 14)
+        df['MACD'], df['MACD_Signal'], _ = talib.MACD(df['close'])
+        
+        # İleri Seviye Göstergeler
+        df['ATR_14'] = talib.ATR(df['high'], df['low'], df['close'], 14)
+        df['SuperTrend'] = calculate_supertrend(df)
+        
+        return df.dropna()
+    except Exception as e:
+        logging.error(f"Gösterge hesaplama hatası: {str(e)}")
+        return pd.DataFrame()
+
+def train_ml_model(df):
+    """Makine Öğrenimi Modeli Eğitimi"""
+    try:
+        if len(df) < 100:
+            return None, None
+            
+        features = df[['SMA_20', 'EMA_20', 'RSI_14', 'MACD', 'ATR_14', 'SuperTrend']]
+        target = np.where(df['close'].shift(-1) > df['close'], 1, 0)
+        
+        scaler = StandardScaler()
+        scaled_features = scaler.fit_transform(features)
+        
+        model = RandomForestClassifier(
+            n_estimators=150,
+            max_depth=8,
+            min_samples_split=10,
+            class_weight='balanced',
+            random_state=42
+        )
+        model.fit(scaled_features, target)
+        
+        return model, scaler
+    except Exception as e:
+        logging.error(f"Model eğitim hatası: {str(e)}")
+        return None, None
+
+async def execute_order(symbol, side, amount):
+    """Sipariş Yürütme Fonksiyonu"""
+    try:
+        if side == 'buy':
+            order = await exchange.create_market_buy_order(symbol, amount)
+            logging.info(f"ALIM: {amount:.4f} {symbol} @ {order['price']}")
+            return float(order['price'])
+            
+        elif side == 'sell':
+            order = await exchange.create_market_sell_order(symbol, amount)
+            logging.info(f"SATIM: {amount:.4f} {symbol} @ {order['price']}")
+            return float(order['price'])
+            
+    except Exception as e:
+        logging.error(f"Sipariş hatası ({symbol}): {str(e)}")
+        return None
+
+class AutoRiskStrategy(Strategy):
+    """Otomatik Risk Yönetimli Strateji"""
+    def init(self):
+        self.risk_manager = DynamicRiskManager()
+        self.model = None
+        self.scaler = None
+        
+    def next(self):
+        try:
+            symbol = self.data.symbol
+            df = self.data.df
+            
+            # Model Güncelleme
+            if symbol not in models or len(df) % 1000 == 0:
+                model, scaler = train_ml_model(df)
+                if model:
+                    models[symbol] = model
+                    scalers[symbol] = scaler
+                    
+            if symbol in models:
+                # Özellik Hazırlama
+                features = df[['SMA_20', 'EMA_20', 'RSI_14', 'MACD', 'ATR_14', 'SuperTrend']]
+                scaled_features = scalers[symbol].transform(features.tail(1))
+                
+                # Tahmin
+                proba = models[symbol].predict_proba(scaled_features)[0]
+                current_rsi = df['RSI_14'].iloc[-1]
+                
+                # Risk Hesaplama
+                position_size, risk_params = self.risk_manager.calculate_adaptive_risk(
+                    symbol, df, self.equity
+                )
+                
+                # Alım Koşulları
+                if (proba[1] > 0.65 and 
+                    current_rsi < 40 and 
+                    df['SuperTrend'].iloc[-1] < df['close'].iloc[-1]):
+                    
+                    if position_size > 0 and not self.position:
+                        self.buy(size=position_size)
+                        
+                # Satım Koşulları
+                elif self.position and (proba[0] > 0.6 or 
+                                      current_rsi > 70 or 
+                                      df['SuperTrend'].iloc[-1] > df['close'].iloc[-1]):
+                    self.sell()
+                    
+        except Exception as e:
+            logging.error(f"Strateji hatası: {str(e)}")
+
+async def main():
+    """Ana İşlem Döngüsü"""
+    await exchange.load_markets()
+    portfolio = {'USDT': INITIAL_BALANCE}
+    risk_manager = DynamicRiskManager()
+    
+    while True:
+        try:
+            # Sembol Seçimi
+            symbols = [symbol for symbol in exchange.symbols if symbol.endswith('/USDT')][:20]
+            
+            # Asenkron Veri Çekme
+            tasks = [fetch_ohlcv(symbol, TIMEFRAME) for symbol in symbols]
+            dataframes = await asyncio.gather(*tasks)
+            
+            for symbol, df in zip(symbols, dataframes):
+                if df.empty:
+                    continue
+                    
+                # Veri İşleme
+                df = calculate_indicators(df)
+                
+                # Model Güncelleme
+                if symbol not in models or len(df) % 1000 == 0:
+                    model, scaler = train_ml_model(df)
+                    if model:
+                        models[symbol] = model
+                        scalers[symbol] = scaler
+                        
+                # Pozisyon Yönetimi
+                current_price = df['close'].iloc[-1]
+                if symbol in open_positions:
+                    entry_price = open_positions[symbol]['price']
+                    current_profit = (current_price - entry_price) / entry_price
+                    
+                    # Dinamik Stop-Loss/Take-Profit
+                    volatility = df['close'].pct_change().std() * np.sqrt(365)
+                    dynamic_sl = -0.02 * (volatility / 0.05)  # %5 volatilite baz alındı
+                    dynamic_tp = 0.03 * (volatility / 0.05)
+                    
+                    if current_profit <= dynamic_sl or current_profit >= dynamic_tp:
+                        sold_price = await execute_order(symbol, 'sell', open_positions[symbol]['amount'])
+                        if sold_price:
+                            portfolio['USDT'] += sold_price * open_positions[symbol]['amount']
+                            del open_positions[symbol]
+                            
+                # Sinyal Üretme
+                if symbol in models and scalers[symbol]:
+                    # Risk Hesaplama
+                    position_size, risk_params = risk_manager.calculate_adaptive_risk(
+                        symbol, df, portfolio['USDT']
+                    )
+                    
+                    # Özellikler ve Tahmin
+                    features = df[['SMA_20', 'EMA_20', 'RSI_14', 'MACD', 'ATR_14', 'SuperTrend']]
+                    scaled_features = scalers[symbol].transform(features.tail(1))
+                    proba = models[symbol].predict_proba(scaled_features)[0]
+                    
+                    # Alım Koşulları
+                    if (proba[1] > 0.65 and 
+                        df['RSI_14'].iloc[-1] < 40 and 
+                        df['SuperTrend'].iloc[-1] < df['close'].iloc[-1] and 
+                        position_size > 0):
+                        
+                        bought_price = await execute_order(symbol, 'buy', position_size)
+                        if bought_price:
+                            open_positions[symbol] = {
+                                'price': bought_price,
+                                'amount': position_size,
+                                'risk_params': risk_params
+                            }
+                            portfolio['USDT'] -= bought_price * position_size
+                            
+            # Performans Raporu
+            if time.time() % 3600 < 300:  # Saatlik rapor
+                total_value = portfolio['USDT'] + sum(
+                    pos['price'] * pos['amount'] for pos in open_positions.values()
+                )
+                logging.info(f"Portföy Değeri: {total_value:.2f} USDT")
+                
+            await asyncio.sleep(300)
+            
+        except Exception as e:
+            logging.critical(f"Ana döngü hatası: {str(e)}")
+            await asyncio.sleep(60)
+
+if __name__ == "__main__":
+    asyncio.run(main())
